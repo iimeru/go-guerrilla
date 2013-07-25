@@ -218,7 +218,8 @@ func configure() {
 	return
 }
 
-func run(saveMail mailSaver) {
+// Runs the mailserver with the given mailSaver
+func Run(saveMail mailSaver) {
 	configure()
 	cert, err := tls.LoadX509KeyPair(gConfig["GSMTP_PUB_KEY"], gConfig["GSMTP_PRV_KEY"])
 	if err != nil {
