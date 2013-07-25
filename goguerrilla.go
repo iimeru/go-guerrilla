@@ -52,7 +52,7 @@ rebuild all: go build -a -v new.go
 
 */
 
-package goguerilla
+package goguerrilla
 
 import (
 	"bufio"
