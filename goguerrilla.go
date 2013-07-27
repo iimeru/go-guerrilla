@@ -52,7 +52,7 @@ rebuild all: go build -a -v new.go
 
 */
 
-package main
+package goguerilla
 
 import (
 	"bufio"
@@ -67,10 +67,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/garyburd/redigo/redis"
 	"github.com/sloonz/go-iconv"
 	"github.com/sloonz/go-qprintable"
-	"github.com/ziutek/mymysql/autorc"
 	_ "github.com/ziutek/mymysql/godrv"
 	"io"
 	"io/ioutil"
@@ -114,6 +112,9 @@ var allowedHosts = make(map[string]bool, 15)
 var sem chan int // currently active clients
 
 var SaveMailChan chan *Client // workers for saving mail
+var ProcessMailChan chan *Mail    // workers for processing mail
+
+
 // defaults. Overwrite any of these in the configure() function which loads them from a json file
 var gConfig = map[string]string{
 	"GSMTP_MAX_SIZE":         "131072",
@@ -121,11 +122,6 @@ var gConfig = map[string]string{
 	"GSMTP_VERBOSE":          "Y",
 	"GSMTP_LOG_FILE":         "",    // Eg. /var/log/goguerrilla.log or leave blank if no logging
 	"GSMTP_TIMEOUT":          "100", // how many seconds before timeout.
-	"MYSQL_HOST":             "127.0.0.1:3306",
-	"MYSQL_USER":             "gmail_mail",
-	"MYSQL_PASS":             "ok",
-	"MYSQL_DB":               "gmail_mail",
-	"GM_MAIL_TABLE":          "new_mail",
 	"GSTMP_LISTEN_INTERFACE": "0.0.0.0:25",
 	"GSMTP_PUB_KEY":          "/etc/ssl/certs/ssl-cert-snakeoil.pem",
 	"GSMTP_PRV_KEY":          "/etc/ssl/private/ssl-cert-snakeoil.key",
@@ -136,12 +132,6 @@ var gConfig = map[string]string{
 	"NGINX_AUTH":             "127.0.0.1:8025", // If using Nginx proxy, ip and port to serve Auth requsts
 	"SGID":                   "1008",           // group id
 	"SUID":                   "1008",           // user id, from /etc/passwd
-}
-
-type redisClient struct {
-	count int
-	conn  redis.Conn
-	time  int
 }
 
 func logln(level int, s string) {
@@ -468,27 +458,22 @@ func responseWrite(client *Client) (err error) {
 	return err
 }
 
+type Mail struct {
+	To 			string
+	From        string
+	Subject     string
+	Body        string
+	Date        time.Time
+	Data        string
+	Hash        string
+	IpAddress   string
+}
+
 func saveMail() {
 	var to string
 	var err error
 	var body string
-	var redis_err error
 	var length int
-	redis := &redisClient{}
-	db := autorc.New("tcp", "", gConfig["MYSQL_HOST"], gConfig["MYSQL_USER"], gConfig["MYSQL_PASS"], gConfig["MYSQL_DB"])
-	db.Register("set names utf8")
-	sql := "INSERT INTO " + gConfig["GM_MAIL_TABLE"] + " "
-	sql += "(`date`, `to`, `from`, `subject`, `body`, `charset`, `mail`, `spam_score`, `hash`, `content_type`, `recipient`, `has_attach`, `ip_addr`)"
-	sql += " values (NOW(), ?, ?, ?, ? , 'UTF-8' , ?, 0, ?, '', ?, 0, ?)"
-	ins, sql_err := db.Prepare(sql)
-	if sql_err != nil {
-		logln(2, fmt.Sprintf("Sql statement incorrect: %s", sql_err))
-	}
-	sql = "UPDATE gm2_setting SET `setting_value` = `setting_value`+1 WHERE `setting_name`='received_emails' LIMIT 1"
-	incr, sql_err := db.Prepare(sql)
-	if sql_err != nil {
-		logln(2, fmt.Sprintf("Sql statement incorrect: %s", sql_err))
-	}
 
 	//  receives values from the channel repeatedly until it is closed.
 	for {
@@ -514,55 +499,29 @@ func saveMail() {
 		// compress to save space
 		client.data = compress(add_head + client.data)
 		body = "gzencode"
-		redis_err = redis.redisConnection()
-		if redis_err == nil {
-			_, do_err := redis.conn.Do("SETEX", client.hash, 3600, client.data)
-			if do_err == nil {
-				client.data = ""
-				body = "redis"
-			}
-		} else {
-			logln(1, fmt.Sprintf("redis: %v", redis_err))
-		}
 		// bind data to cursor
-		ins.Bind(
-			to,
-			client.mail_from,
-			client.subject,
-			body,
-			client.data,
-			client.hash,
-			to,
-			client.address)
+		mail := Mail{
+			to, client.mail_from, client.subject, body, time.Now(), client.data, client.hash, client.address, 
+		}
+
+		
+		ProcessMailChan <- mail
+		//////////////////////////
+		//////////////////////////
+        //////////////////////////
+		//////////////////////////
+		//////////////////////////
+
 		// save, discard result
-		_, _, err = ins.Exec()
+		err = nil // ins.Exec()
 		if err != nil {
-			logln(1, fmt.Sprintf("Database error, %v %v", err))
+			logln(1, fmt.Sprintf("Email process error, %v %v", err))
 			client.savedNotify <- -1
 		} else {
-			logln(1, "Email saved "+client.hash+" len:"+strconv.Itoa(length))
-			_, _, err = incr.Exec()
-			if err != nil {
-				logln(1, fmt.Sprintf("Failed to incr count:", err))
-			}
+			logln(1, "Email processed "+client.hash+" len:"+strconv.Itoa(length))
 			client.savedNotify <- 1
 		}
 	}
-}
-
-func (c *redisClient) redisConnection() (err error) {
-	if c.count > 100 {
-		c.conn.Close()
-		c.count = 0
-	}
-	if c.count == 0 {
-		c.conn, err = redis.Dial("tcp", ":6379")
-		if err != nil {
-			// handle error
-			return err
-		}
-	}
-	return nil
 }
 
 func validateEmailData(client *Client) (user string, host string, addr_err error) {
