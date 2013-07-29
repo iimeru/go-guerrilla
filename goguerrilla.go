@@ -1,4 +1,4 @@
-/** 
+/**
 Go-Guerrilla SMTPd
 A minimalist SMTP server written in Go, made for receiving large volumes of mail.
 Works either as a stand-alone or in conjunction with Nginx SMTP proxy.
@@ -45,14 +45,14 @@ $ go get github.com/ziutek/mymysql/autorc
 $ go get github.com/ziutek/mymysql/godrv
 $ go get github.com/sloonz/go-iconv
 
-TODO: after failing tls, 
+TODO: after failing tls,
 
 patch:
 rebuild all: go build -a -v new.go
 
 */
 
-package goguerilla
+package goguerrilla
 
 import (
 	"bufio"
@@ -63,9 +63,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"github.com/sloonz/go-iconv"
 	"github.com/sloonz/go-qprintable"
@@ -111,28 +109,11 @@ var timeout time.Duration
 var allowedHosts = make(map[string]bool, 15)
 var sem chan int // currently active clients
 
-var SaveMailChan chan *Client // workers for saving mail
-var ProcessMailChan chan *Mail    // workers for processing mail
-
+var saveMailChan chan *Client  // workers for saving mail
+var ProcessMailChan chan *Mail // workers for processing mail
 
 // defaults. Overwrite any of these in the configure() function which loads them from a json file
-var gConfig = map[string]string{
-	"GSMTP_MAX_SIZE":         "131072",
-	"GSMTP_HOST_NAME":        "server.example.com", // This should also be set to reflect your RDNS
-	"GSMTP_VERBOSE":          "Y",
-	"GSMTP_LOG_FILE":         "",    // Eg. /var/log/goguerrilla.log or leave blank if no logging
-	"GSMTP_TIMEOUT":          "100", // how many seconds before timeout.
-	"GSTMP_LISTEN_INTERFACE": "0.0.0.0:25",
-	"GSMTP_PUB_KEY":          "/etc/ssl/certs/ssl-cert-snakeoil.pem",
-	"GSMTP_PRV_KEY":          "/etc/ssl/private/ssl-cert-snakeoil.key",
-	"GM_ALLOWED_HOSTS":       "guerrillamail.de,guerrillamailblock.com",
-	"GM_PRIMARY_MAIL_HOST":   "guerrillamail.com",
-	"GM_MAX_CLIENTS":         "500",
-	"NGINX_AUTH_ENABLED":     "N",              // Y or N
-	"NGINX_AUTH":             "127.0.0.1:8025", // If using Nginx proxy, ip and port to serve Auth requsts
-	"SGID":                   "1008",           // group id
-	"SUID":                   "1008",           // user id, from /etc/passwd
-}
+var gConfig map[string]string
 
 func logln(level int, s string) {
 
@@ -147,31 +128,9 @@ func logln(level int, s string) {
 	}
 }
 
-func configure() {
-	var configFile, verbose, iface string
+func configure(config map[string]string) {
+	gConfig = config
 	log.SetOutput(os.Stdout)
-	// parse command line arguments
-	flag.StringVar(&configFile, "config", "goguerrilla.conf", "Path to the configuration file")
-	flag.StringVar(&verbose, "v", "n", "Verbose, [y | n] ")
-	flag.StringVar(&iface, "if", "", "Interface and port to listen on, eg. 127.0.0.1:2525 ")
-	flag.Parse()
-	// load in the config.
-	b, err := ioutil.ReadFile(configFile)
-	if err != nil {
-		log.Fatalln("Could not read config file")
-	}
-	var myConfig map[string]string
-	err = json.Unmarshal(b, &myConfig)
-	if err != nil {
-		log.Fatalln("Could not parse config file")
-	}
-	for k, v := range myConfig {
-		gConfig[k] = v
-	}
-	gConfig["GSMTP_VERBOSE"] = strings.ToUpper(verbose)
-	if len(iface) > 0 {
-		gConfig["GSTMP_LISTEN_INTERFACE"] = iface
-	}
 	// map the allow hosts for easy lookup
 	if arr := strings.Split(gConfig["GM_ALLOWED_HOSTS"], ","); len(arr) > 0 {
 		for i := 0; i < len(arr); i++ {
@@ -187,7 +146,8 @@ func configure() {
 	// currently active client list
 	sem = make(chan int, n)
 	// database writing workers
-	SaveMailChan = make(chan *Client, 5)
+	saveMailChan = make(chan *Client, 5)
+	ProcessMailChan = make(chan *Mail, 5)
 	// timeout for reads
 	if n, n_err = strconv.Atoi(gConfig["GSMTP_TIMEOUT"]); n_err != nil {
 		timeout = time.Duration(10)
@@ -210,8 +170,8 @@ func configure() {
 	return
 }
 
-func main() {
-	configure()
+func Run(config map[string]string, mailSaver func(chan *Mail)) {
+	configure(config)
 	cert, err := tls.LoadX509KeyPair(gConfig["GSMTP_PUB_KEY"], gConfig["GSMTP_PRV_KEY"])
 	if err != nil {
 		logln(2, fmt.Sprintf("There was a problem with loading the certificate: %s", err))
@@ -338,9 +298,9 @@ func handleClient(client *Client) {
 			var err error
 			client.data, err = readSmtp(client)
 			if err == nil {
-				// to do: timeout when adding to SaveMailChan
+				// to do: timeout when adding to saveMailChan
 				// place on the channel so that one of the save mail workers can pick it up
-				SaveMailChan <- client
+				saveMailChan <- client
 				// wait for the save to complete
 				status := <-client.savedNotify
 
@@ -459,7 +419,7 @@ func responseWrite(client *Client) (err error) {
 }
 
 type Mail struct {
-	To 			string
+	To          string
 	From        string
 	Subject     string
 	Body        string
@@ -467,17 +427,16 @@ type Mail struct {
 	Data        string
 	Hash        string
 	IpAddress   string
+	SavedNotify chan int
 }
 
 func saveMail() {
 	var to string
-	var err error
 	var body string
-	var length int
 
 	//  receives values from the channel repeatedly until it is closed.
 	for {
-		client := <-SaveMailChan
+		client := <-saveMailChan
 		if user, _, addr_err := validateEmailData(client); addr_err != nil { // user, host, addr_err
 			logln(1, fmt.Sprintln("mail_from didnt validate: %v", addr_err)+" client.mail_from:"+client.mail_from)
 			// notify client that a save completed, -1 = error
@@ -486,7 +445,6 @@ func saveMail() {
 		} else {
 			to = user + "@" + gConfig["GM_PRIMARY_MAIL_HOST"]
 		}
-		length = len(client.data)
 		client.subject = mimeHeaderDecode(client.subject)
 		client.hash = md5hex(to + client.mail_from + client.subject + strconv.FormatInt(time.Now().UnixNano(), 10))
 		// Add extra headers
@@ -500,27 +458,11 @@ func saveMail() {
 		client.data = compress(add_head + client.data)
 		body = "gzencode"
 		// bind data to cursor
-		mail := Mail{
-			to, client.mail_from, client.subject, body, time.Now(), client.data, client.hash, client.address, 
+		mail := &Mail{
+			to, client.mail_from, client.subject, body, time.Now(), client.data, client.hash, client.address, client.savedNotify,
 		}
 
-		
 		ProcessMailChan <- mail
-		//////////////////////////
-		//////////////////////////
-        //////////////////////////
-		//////////////////////////
-		//////////////////////////
-
-		// save, discard result
-		err = nil // ins.Exec()
-		if err != nil {
-			logln(1, fmt.Sprintf("Email process error, %v %v", err))
-			client.savedNotify <- -1
-		} else {
-			logln(1, "Email processed "+client.hash+" len:"+strconv.Itoa(length))
-			client.savedNotify <- 1
-		}
 	}
 }
 
@@ -680,7 +622,6 @@ func nginxHTTPAuth() {
 	if err != nil {
 		log.Fatal("ListenAndServe: ", err)
 	}
-
 }
 
 func nginxHTTPAuthHandler(w http.ResponseWriter, r *http.Request) {
