@@ -170,7 +170,7 @@ func configure(config map[string]string) {
 	return
 }
 
-func Run(config map[string]string, mailSaver func(chan *Mail)) {
+func Run(config map[string]string) {
 	configure(config)
 	cert, err := tls.LoadX509KeyPair(gConfig["GSMTP_PUB_KEY"], gConfig["GSMTP_PRV_KEY"])
 	if err != nil {
